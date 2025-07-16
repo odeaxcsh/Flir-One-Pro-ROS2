@@ -1,29 +1,40 @@
-#include <signal.h>
-#include "driver_flir.h"
+#include <csignal>
+#include <thread>
+#include "rclcpp/rclcpp.hpp"
+#include "driver_flir.hpp" // Adjust include if necessary based on your package structure
 
 void sigsegv_handler(int sig)
 {
-  signal(SIGSEGV, SIG_DFL);
-  ROS_ERROR("Segmentation fault, stopping camera.");
-  ros::shutdown();                      // stop the main loop
+  std::signal(SIGSEGV, SIG_DFL);
+  RCLCPP_ERROR(rclcpp::get_logger("camera_flir_node"), "Segmentation fault, stopping camera.");
+  rclcpp::shutdown();
 }
 
-int main(int argc, char **argv)
+int main(int argc, char * argv[])
 {
-  ros::init(argc, argv, "camera_flir_node");
-  ros::NodeHandle node;
-  ros::NodeHandle priv_nh("~");
-  ros::NodeHandle camera_nh("~");
-  signal(SIGSEGV, &sigsegv_handler);
-  driver_flir::DriverFlir dvr(node, priv_nh, camera_nh);
-  ros::AsyncSpinner spinner(4);
+  rclcpp::init(argc, argv);
+  std::signal(SIGSEGV, sigsegv_handler);
+
+  auto node = rclcpp::Node::make_shared("camera_flir_node");
+
+  driver_flir::DriverFlir dvr(node);
   dvr.setup();
-  spinner.start();
-  while (node.ok() && dvr.ok()){
+
+  rclcpp::executors::MultiThreadedExecutor executor;
+  executor.add_node(node);
+
+  std::thread spinner([&executor]() {
+    executor.spin();
+  });
+
+  while (rclcpp::ok() && dvr.ok()){
     dvr.poll();
   }
 
-  ros::waitForShutdown();
+  rclcpp::shutdown();
+  if (spinner.joinable()) {
+    spinner.join();
+  }
   dvr.shutdown();
 
   return 0;

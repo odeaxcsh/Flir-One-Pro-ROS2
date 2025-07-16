@@ -1,30 +1,34 @@
-#include <boost/format.hpp>
-#include <opencv2/highgui.hpp>
-#include "driver_flir.h"
+#include <chrono>
+#include <ctime>
+#include <cstring>
+#include <cassert>
+#include <thread>
 
-//#define DEBUG_
+#include <rclcpp/rclcpp.hpp>
+#include "sensor_msgs/msg/image.hpp"
+#include "sensor_msgs/image_encodings.hpp"
+#include "cv_bridge/cv_bridge.h"
+#include <opencv2/highgui.hpp>
+
+#include "driver_flir.h"
 
 namespace driver_flir
 {
 
-  DriverFlir::DriverFlir( ros::NodeHandle nh,
-                        ros::NodeHandle priv_nh,
-                        ros::NodeHandle camera_nh):
-    nh_(nh),
-    priv_nh_(priv_nh),
-    camera_nh_(camera_nh),
+  DriverFlir::DriverFlir(const rclcpp::Node::SharedPtr node) :
+    node_(node),
     camera_name_("FLIR_USB"),
     camera_frame_("flir"),
     isOk(true),
     states(INIT),
     setup_states(SETUP_INIT),
-    context(NULL),
+    context(nullptr),
     vendor_id(0x09cb),
-    product_id(0x1996),
-    it_(new image_transport::ImageTransport(camera_nh_)){
-    image_pub_ = priv_nh.advertise<sensor_msgs::Image>("ir_16b/image_raw", 1);
-    image_rgb_pub_ = priv_nh.advertise<sensor_msgs::Image>("rgb/image_raw", 1);
-    image_8b_pub_ = priv_nh.advertise<sensor_msgs::Image>("ir_8b/image_raw", 1);
+    product_id(0x1996)
+  {
+    image_pub_ = node_->create_publisher<sensor_msgs::msg::Image>("ir_16b/image_raw", 1);
+    image_rgb_pub_ = node_->create_publisher<sensor_msgs::msg::Image>("rgb/image_raw", 1);
+    image_8b_pub_ = node_->create_publisher<sensor_msgs::msg::Image>("ir_8b/image_raw", 1);
   }
 
   DriverFlir::~DriverFlir() {
@@ -33,7 +37,7 @@ namespace driver_flir
   void DriverFlir::shutdown() {
     libusb_reset_device(devh);
     libusb_close(devh);
-    libusb_exit(NULL);
+    libusb_exit(nullptr);
     isOk = false;
   }
 
@@ -41,149 +45,121 @@ namespace driver_flir
     return isOk;
   }
 
-  void DriverFlir::publish(const sensor_msgs::ImagePtr &image) {
-    image_pub_.publish(image);
+  void DriverFlir::publish(const sensor_msgs::msg::Image::SharedPtr &image) {
+    image_pub_->publish(*image);
   }
 
-
-  void DriverFlir::print_bulk_result(char ep[],char EP_error[], int r, int actual_length, unsigned char buf[]) {
-          time_t now1;
-          int i;
-
-          now1 = time(NULL);
-          if (r < 0) {
-                 if (strcmp (EP_error, libusb_error_name(r))!=0) {
-                     strcpy(EP_error, libusb_error_name(r));
-                     fprintf(stderr, "\n: %s >>>>>>>>>>>>>>>>>bulk transfer (in) %s: %s\n", ctime(&now1), ep , libusb_error_name(r));
-                     sleep(1);
-                 }
-                 //return 1;
-         } else {
-             ROS_INFO("\n: %s bulk read EP %s, actual length %d\nHEX:\n",ctime(&now1), ep ,actual_length);
-         }
+  void DriverFlir::print_bulk_result(char ep[], char EP_error[], int r, int actual_length, unsigned char buf[]) {
+    std::time_t now1 = std::time(nullptr);
+    if (r < 0) {
+      if (strcmp(EP_error, libusb_error_name(r)) != 0) {
+        strcpy(EP_error, libusb_error_name(r));
+        RCLCPP_ERROR(node_->get_logger(), "\n: %s >>>>>>>>>>>>>>>>>bulk transfer (in) %s: %s",
+                     std::ctime(&now1), ep , libusb_error_name(r));
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+      }
+    } else {
+      RCLCPP_INFO(node_->get_logger(), "\n: %s bulk read EP %s, actual length %d", std::ctime(&now1), ep, actual_length);
+    }
   }
 
-  void DriverFlir::read(char ep[],char EP_error[], int r, int actual_length, unsigned char buf[]) {
+  void DriverFlir::read(char ep[], char EP_error[], int r, int actual_length, unsigned char buf[]) {
     // reset buffer if the new chunk begins with magic bytes or the buffer size limit is exceeded
-    unsigned char magicbyte[4]={0xEF,0xBE,0x00,0x00};
+    unsigned char magicbyte[4] = {0xEF, 0xBE, 0x00, 0x00};
 
-    if  ((strncmp (( const char *)buf, ( const char *)magicbyte,4)==0 ) || ((buf85pointer + actual_length) >= BUF85SIZE)) {
-      buf85pointer=0;
+    if ((strncmp(reinterpret_cast<const char*>(buf), reinterpret_cast<const char*>(magicbyte), 4) == 0) ||
+        ((buf85pointer + actual_length) >= BUF85SIZE)) {
+      buf85pointer = 0;
     }
 
-    memmove(buf85+buf85pointer, buf, actual_length);
-    buf85pointer=buf85pointer+actual_length;
+    memmove(buf85 + buf85pointer, buf, actual_length);
+    buf85pointer += actual_length;
 
-    if  ((strncmp (( const char *)buf85, ( const char *)magicbyte,4)!=0 )) {
-      buf85pointer=0;
-      ROS_ERROR("Reset buffer because of bad Magic Byte!");
+    if (strncmp(reinterpret_cast<const char*>(buf85), reinterpret_cast<const char*>(magicbyte), 4) != 0) {
+      buf85pointer = 0;
+      RCLCPP_ERROR(node_->get_logger(), "Reset buffer because of bad Magic Byte!");
       return;
     }
 
-    // a quick and dirty job for gcc
-    uint32_t FrameSize   = buf85[ 8] + (buf85[ 9] << 8) + (buf85[10] << 16) + (buf85[11] << 24);
+    uint32_t FrameSize   = buf85[8]  + (buf85[9]  << 8) + (buf85[10] << 16) + (buf85[11] << 24);
     uint32_t ThermalSize = buf85[12] + (buf85[13] << 8) + (buf85[14] << 16) + (buf85[15] << 24);
     uint32_t JpgSize     = buf85[16] + (buf85[17] << 8) + (buf85[18] << 16) + (buf85[19] << 24);
     uint32_t StatusSize  = buf85[20] + (buf85[21] << 8) + (buf85[22] << 16) + (buf85[23] << 24);
 
-    if ( (FrameSize+28) > (buf85pointer) ) {
-      // wait for next chunk
-      ROS_ERROR("wait for next chunk");
+    if ((FrameSize + 28) > buf85pointer) {
+      RCLCPP_ERROR(node_->get_logger(), "wait for next chunk");
       return;
     }
-	ros::Time stamp = ros::Time::now();
-    int i,v;
+    rclcpp::Time stamp = node_->now();
+
     // get a full frame, first print status
-    t1=t2;
-    gettimeofday(&t2, NULL);
-    // fps as moving average over last 20 frames
-    fps_t = (19*fps_t+10000000/(((t2.tv_sec * 1000000) + t2.tv_usec) - ((t1.tv_sec * 1000000) + t1.tv_usec)))/20;
+    t1 = t2;
+    gettimeofday(&t2, nullptr);
+    fps_t = (19 * fps_t + 10000000 / (((t2.tv_sec * 1000000) + t2.tv_usec) - ((t1.tv_sec * 1000000) + t1.tv_usec))) / 20;
 
 #ifdef DEBUG_
-    ROS_INFO("#%lld/10 fps:",fps_t);
-    ROS_INFO("FrameSize %d ",FrameSize);
-    ROS_INFO("ThermalSize %d ",ThermalSize);
-    ROS_INFO("JpgSize %d ",JpgSize);
-    ROS_INFO("StatusSize %d ",StatusSize);
+    RCLCPP_INFO(node_->get_logger(), "#%lld/10 fps:", fps_t);
+    RCLCPP_INFO(node_->get_logger(), "FrameSize %d ", FrameSize);
+    RCLCPP_INFO(node_->get_logger(), "ThermalSize %d ", ThermalSize);
+    RCLCPP_INFO(node_->get_logger(), "JpgSize %d ", JpgSize);
+    RCLCPP_INFO(node_->get_logger(), "StatusSize %d ", StatusSize);
 #endif
 
-    unsigned short pix[160*120];
+    unsigned short pix[160 * 120];
+    int v;
     for (uint8_t y = 0; y < 120; ++y) {
       for (uint8_t x = 0; x < 160; ++x) {
-        if (x<80) {
-          v = buf85[2*(y * 164 + x) +32]+256*buf85[2*(y * 164 + x) +33];
-        }else {
-          v = buf85[2*(y * 164 + x) +32+4]+256*buf85[2*(y * 164 + x) +33+4];
+        if (x < 80) {
+          v = buf85[2 * (y * 164 + x) + 32] + 256 * buf85[2 * (y * 164 + x) + 33];
+        } else {
+          v = buf85[2 * (y * 164 + x) + 32 + 4] + 256 * buf85[2 * (y * 164 + x) + 33 + 4];
         }
-        pix[y * 160 + x] = v;   // unsigned char!!
+        pix[y * 160 + x] = static_cast<unsigned short>(v);
       }
     }
 
     cv_bridge::CvImage out_msg;
-	cv::Mat im16 = cv::Mat (120, 160, CV_16UC1, pix);
+    cv::Mat im16 = cv::Mat(120, 160, CV_16UC1, pix);
     out_msg.header.frame_id = camera_frame_;
-	out_msg.header.stamp = stamp;
-    out_msg.encoding = sensor_msgs::image_encodings::TYPE_16UC1; // Or whatever
-    out_msg.image    = 	im16;
+    out_msg.header.stamp = stamp;
+    out_msg.encoding = sensor_msgs::image_encodings::TYPE_16UC1;
+    out_msg.image = im16;
 
-    image_pub_.publish(out_msg.toImageMsg());
+    image_pub_->publish(*out_msg.toImageMsg());
 
+    cv::Mat rawRgb = cv::Mat(1, JpgSize, CV_8UC1, &buf85[28 + ThermalSize]);
+    cv::Mat decodedImage = cv::imdecode(rawRgb, cv::IMREAD_COLOR);
+    cv::cvtColor(decodedImage, decodedImage, cv::COLOR_BGR2RGB);
 
-	cv::Mat rawRgb = cv::Mat(1, JpgSize, CV_8UC1, &buf85[28+ThermalSize]);
-	cv::Mat decodedImage  =  cv::imdecode( rawRgb, CV_LOAD_IMAGE_COLOR);
-	cv::cvtColor(decodedImage, decodedImage, cv::COLOR_BGR2RGB);
-	std_msgs::Header header;
-	header.frame_id = camera_frame_;
-	header.stamp = stamp;
-	
-	sensor_msgs::ImagePtr msg = cv_bridge::CvImage(header,"rgb8", decodedImage).toImageMsg();
-	msg->encoding = "rgb8" ;
-        image_rgb_pub_.publish(msg);
+    sensor_msgs::msg::Image ros_img;
+    ros_img.header.frame_id = camera_frame_;
+    ros_img.header.stamp = stamp;
+    auto msg = cv_bridge::CvImage(ros_img.header, "rgb8", decodedImage).toImageMsg();
+    image_rgb_pub_->publish(*msg);
 
-
-    // Max & Min value used for scaling
-    // (limits: -20° - +75° | 1600 - 5852)
-    // 
-    // Theorical IR Sensor sensitivity : 0.1°C
-	int max = 3847; // <=>  40°C
-	int min = 2934; // <=>  20°C
-	int delta = max - min;
-	cv::Mat im8b = 255*(im16-min)/(max-min);
-    im8b.convertTo(im8b , CV_8UC1);
-	cv_bridge::CvImage out_8b;
+    int maxVal = 3847;
+    int minVal = 2934;
+    cv::Mat im8b = 255 * (im16 - minVal) / (maxVal - minVal);
+    im8b.convertTo(im8b, CV_8UC1);
+    cv_bridge::CvImage out_8b;
     out_8b.header.frame_id = camera_frame_;
-	out_8b.header.stamp = stamp;
-    out_8b.encoding = sensor_msgs::image_encodings::TYPE_8UC1; // Or whatever
-    out_8b.image    =  im8b;
-	image_8b_pub_.publish(out_8b.toImageMsg());
-
-
-
+    out_8b.header.stamp = stamp;
+    out_8b.encoding = sensor_msgs::image_encodings::TYPE_8UC1;
+    out_8b.image = im8b;
+    image_8b_pub_->publish(*out_8b.toImageMsg());
   }
 
-  void DriverFlir::poll(void){
- 	  unsigned char data[2]={0,0}; // only a bad dummy
+  void DriverFlir::poll(void) {
+    unsigned char data[2] = {0, 0};
     int r = 0;
-    time_t now;
+    std::time_t now;
 
     switch (states) {
-      /* Flir config
-      01 0b 01 00 01 00 00 00 c4 d5
-      0 bmRequestType = 01
-      1 bRequest = 0b
-      2 wValue 0001 type (H) index (L)    stop=0/start=1 (Alternate Setting)
-      4 wIndex 01                         interface 1/2
-      5 wLength 00
-      6 Data 00 00
-
-      libusb_control_transfer (*dev_handle, bmRequestType, bRequest, wValue,  wIndex, *data, wLength, timeout)
-      */
-
       case INIT:
-        ROS_INFO("stop interface 2 FRAME\n");
-        r = libusb_control_transfer(devh,1,0x0b,0,2,data,0,100);
+        RCLCPP_INFO(node_->get_logger(), "stop interface 2 FRAME");
+        r = libusb_control_transfer(devh, 1, 0x0b, 0, 2, data, 0, 100);
         if (r < 0) {
-          ROS_ERROR("Control Out error %d\n", r);
+          RCLCPP_ERROR(node_->get_logger(), "Control Out error %d", r);
           error_code = r;
           states = ERROR;
         } else {
@@ -192,10 +168,10 @@ namespace driver_flir
         break;
 
       case INIT_1:
-        ROS_INFO("stop interface 1 FILEIO\n");
-        r = libusb_control_transfer(devh,1,0x0b,0,1,data,0,100);
+        RCLCPP_INFO(node_->get_logger(), "stop interface 1 FILEIO");
+        r = libusb_control_transfer(devh, 1, 0x0b, 0, 1, data, 0, 100);
         if (r < 0) {
-          ROS_ERROR("Control Out error %d\n", r);
+          RCLCPP_ERROR(node_->get_logger(), "Control Out error %d", r);
           error_code = r;
           states = ERROR;
         } else {
@@ -204,10 +180,10 @@ namespace driver_flir
         break;
 
       case INIT_2:
-        ROS_INFO("\nstart interface 1 FILEIO\n");
-        r = libusb_control_transfer(devh,1,0x0b,1,1,data,0,100);
+        RCLCPP_INFO(node_->get_logger(), "\nstart interface 1 FILEIO");
+        r = libusb_control_transfer(devh, 1, 0x0b, 1, 1, data, 0, 100);
         if (r < 0) {
-          ROS_ERROR("Control Out error %d\n", r);
+          RCLCPP_ERROR(node_->get_logger(), "Control Out error %d", r);
           error_code = r;
           states = ERROR;
         } else {
@@ -217,155 +193,128 @@ namespace driver_flir
 
       case ASK_ZIP:
       {
-        ROS_INFO("\nask for CameraFiles.zip on EP 0x83:\n");
-        now = time(0); // Get the system time
-        ROS_INFO("\n: %s",ctime(&now));
-
+        RCLCPP_INFO(node_->get_logger(), "\nask for CameraFiles.zip on EP 0x83:");
+        now = std::time(nullptr);
+        RCLCPP_INFO(node_->get_logger(), "\n: %s", std::ctime(&now));
         int transferred = 0;
         char my_string[128];
 
-        //--------- write string: {"type":"openFile","data":{"mode":"r","path":"CameraFiles.zip"}}
         int length = 16;
-        unsigned char my_string2[16]={0xcc,0x01,0x00,0x00,0x01,0x00,0x00,0x00,0x41,0x00,0x00,0x00,0xF8,0xB3,0xF7,0x00};
-        ROS_INFO("\nEP 0x02 to be sent Hexcode: %i Bytes[",length);
-        int i;
-        for (i = 0; i < length; i++) {
-          ROS_INFO(" %02x", my_string2[i]);
+        unsigned char my_string2[16] = {0xcc, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x41, 0x00, 0x00, 0x00, 0xF8, 0xB3, 0xF7, 0x00};
+        RCLCPP_INFO(node_->get_logger(), "\nEP 0x02 to be sent Hexcode: %i Bytes[", length);
+        for (int i = 0; i < length; i++) {
+          RCLCPP_INFO(node_->get_logger(), " %02x", my_string2[i]);
         }
-        ROS_INFO(" ]\n");
+        RCLCPP_INFO(node_->get_logger(), " ]");
 
         r = libusb_bulk_transfer(devh, 2, my_string2, length, &transferred, 0);
-        if(r == 0 && transferred == length) {
-          ROS_INFO("\nWrite successful!");
+        if (r == 0 && transferred == length) {
+          RCLCPP_INFO(node_->get_logger(), "\nWrite successful!");
+        } else {
+          RCLCPP_ERROR(node_->get_logger(), "\nError in write! res = %d and transferred = %d", r, transferred);
         }
-        else {
-          ROS_ERROR("\nError in write! res = %d and transferred = %d\n", r, transferred);
-        }
 
-        strcpy(  my_string,"{\"type\":\"openFile\",\"data\":{\"mode\":\"r\",\"path\":\"CameraFiles.zip\"}}");
+        strcpy(my_string, "{\"type\":\"openFile\",\"data\":{\"mode\":\"r\",\"path\":\"CameraFiles.zip\"}}");
+        length = strlen(my_string) + 1;
+        RCLCPP_INFO(node_->get_logger(), "\nEP 0x02 to be sent: %s", my_string);
 
-        length = strlen(my_string)+1;
-        ROS_INFO("\nEP 0x02 to be sent: %s", my_string);
-
-        // avoid error: invalid conversion from ‘char*’ to ‘unsigned char*’ [-fpermissive]
-        unsigned char *my_string1 = (unsigned char*)my_string;
-        //my_string1 = (unsigned char*)my_string;
-
+        unsigned char *my_string1 = reinterpret_cast<unsigned char*>(my_string);
         r = libusb_bulk_transfer(devh, 2, my_string1, length, &transferred, 0);
-        if(r == 0 && transferred == length) {
-          ROS_INFO("\nWrite successful!");
-          ROS_INFO("\nSent %d bytes with string: %s\n", transferred, my_string);
-        }
-        else {
-          ROS_ERROR("\nError in write! res = %d and transferred = %d\n", r, transferred);
+        if (r == 0 && transferred == length) {
+          RCLCPP_INFO(node_->get_logger(), "\nWrite successful!");
+          RCLCPP_INFO(node_->get_logger(), "\nSent %d bytes with string: %s", transferred, my_string);
+        } else {
+          RCLCPP_ERROR(node_->get_logger(), "\nError in write! res = %d and transferred = %d", r, transferred);
         }
 
-        //--------- write string: {"type":"readFile","data":{"streamIdentifier":10}}
         length = 16;
-        unsigned char my_string3[16]={0xcc,0x01,0x00,0x00,0x01,0x00,0x00,0x00,0x33,0x00,0x00,0x00,0xef,0xdb,0xc1,0xc1};
-        ROS_INFO("\nEP 0x02 to be sent Hexcode: %i Bytes[",length);
-        for (i = 0; i < length; i++) {
-          ROS_INFO(" %02x", my_string3[i]);
+        unsigned char my_string3[16] = {0xcc, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x33, 0x00, 0x00, 0x00, 0xef, 0xdb, 0xc1, 0xc1};
+        RCLCPP_INFO(node_->get_logger(), "\nEP 0x02 to be sent Hexcode: %i Bytes[", length);
+        for (int i = 0; i < length; i++) {
+          RCLCPP_INFO(node_->get_logger(), " %02x", my_string3[i]);
         }
-        ROS_INFO(" ]\n");
+        RCLCPP_INFO(node_->get_logger(), " ]");
 
         r = libusb_bulk_transfer(devh, 2, my_string3, length, &transferred, 0);
-        if(r == 0 && transferred == length) {
-          ROS_INFO("\nWrite successful!");
+        if (r == 0 && transferred == length) {
+          RCLCPP_INFO(node_->get_logger(), "\nWrite successful!");
+        } else {
+          RCLCPP_ERROR(node_->get_logger(), "\nError in write! res = %d and transferred = %d", r, transferred);
         }
-        else {
-          ROS_ERROR("\nError in write! res = %d and transferred = %d\n", r, transferred);
-        }
 
-        //strcpy(  my_string, "{\"type\":\"setOption\",\"data\":{\"option\":\"autoFFC\",\"value\":true}}");
-        strcpy(  my_string,"{\"type\":\"readFile\",\"data\":{\"streamIdentifier\":10}}");
-        length = strlen(my_string)+1;
-        ROS_INFO("\nEP 0x02 to be sent %i Bytes: %s", length, my_string);
-
-        // avoid error: invalid conversion from ‘char*’ to ‘unsigned char*’ [-fpermissive]
-        my_string1 = (unsigned char*)my_string;
-
+        strcpy(my_string, "{\"type\":\"readFile\",\"data\":{\"streamIdentifier\":10}}");
+        length = strlen(my_string) + 1;
+        RCLCPP_INFO(node_->get_logger(), "\nEP 0x02 to be sent %i Bytes: %s", length, my_string);
+        my_string1 = reinterpret_cast<unsigned char*>(my_string);
         r = libusb_bulk_transfer(devh, 2, my_string1, length, &transferred, 0);
-        if(r == 0 && transferred == length) {
-          ROS_INFO("\nWrite successful!");
-          ROS_INFO("\nSent %d bytes with string: %s\n", transferred, my_string);
+        if (r == 0 && transferred == length) {
+          RCLCPP_INFO(node_->get_logger(), "\nWrite successful!");
+          RCLCPP_INFO(node_->get_logger(), "\nSent %d bytes with string: %s", transferred, my_string);
+        } else {
+          RCLCPP_ERROR(node_->get_logger(), "\nError in write! res = %d and transferred = %d", r, transferred);
         }
-        else {
-          ROS_ERROR("\nError in write! res = %d and transferred = %d\n", r, transferred);
-        }
-
-        // go to next state
-        now = time(0); // Get the system time
-        ROS_INFO("\n: %s",ctime(&now));
-        //sleep(1);
+        now = std::time(nullptr);
+        RCLCPP_INFO(node_->get_logger(), "\n: %s", std::ctime(&now));
         states = ASK_VIDEO;
       }
       break;
 
       case ASK_VIDEO:
-        ROS_INFO("\nAsk for video stream, start EP 0x85:\n");
-
-        r = libusb_control_transfer(devh,1,0x0b,1,2,data, 2,200);
+        RCLCPP_INFO(node_->get_logger(), "\nAsk for video stream, start EP 0x85:");
+        r = libusb_control_transfer(devh, 1, 0x0b, 1, 2, data, 2, 200);
         if (r < 0) {
-          ROS_ERROR("Control Out error %d\n", r);
+          RCLCPP_ERROR(node_->get_logger(), "Control Out error %d", r);
           error_code = r;
           states = ERROR;
         } else {
           states = POOL_FRAME;
         }
-      break;
+        break;
 
       case POOL_FRAME:
       {
-        // endless loop
-        // poll Frame Endpoints 0x85
-        // don't change timeout=100ms !!
         r = libusb_bulk_transfer(devh, 0x85, buf, sizeof(buf), &actual_length, 200);
-        switch(r){
+        switch(r) {
           case LIBUSB_ERROR_TIMEOUT:
-            ROS_ERROR("LIBUSB_ERROR_TIMEOUT");
+            RCLCPP_ERROR(node_->get_logger(), "LIBUSB_ERROR_TIMEOUT");
             break;
           case LIBUSB_ERROR_PIPE:
-            ROS_ERROR("LIBUSB_ERROR_PIPE");
+            RCLCPP_ERROR(node_->get_logger(), "LIBUSB_ERROR_PIPE");
             break;
           case LIBUSB_ERROR_OVERFLOW:
-            ROS_ERROR("LIBUSB_ERROR_OVERFLOW");
+            RCLCPP_ERROR(node_->get_logger(), "LIBUSB_ERROR_OVERFLOW");
             break;
           case LIBUSB_ERROR_NO_DEVICE:
-            ROS_ERROR("LIBUSB_ERROR_NO_DEVICE");
+            RCLCPP_ERROR(node_->get_logger(), "LIBUSB_ERROR_NO_DEVICE");
             break;
         }
-        if (actual_length > 0){
-          ROS_INFO("T'es une FRAME %d", actual_length );
-          read("0x85",EP85_error, r, actual_length, buf);
+        if (actual_length > 0) {
+          RCLCPP_INFO(node_->get_logger(), "Received a FRAME %d", actual_length);
+          read("0x85", EP85_error, r, actual_length, buf);
         }
       }
-        break;
+      break;
 
       case ERROR:
         isOk = false;
         break;
     }
 
-    // poll Endpoints 0x81, 0x83
     r = libusb_bulk_transfer(devh, 0x81, buf, sizeof(buf), &actual_length, 10);
-    print_bulk_result("0x81",EP81_error, r, actual_length, buf);
-
+    print_bulk_result("0x81", EP81_error, r, actual_length, buf);
     r = libusb_bulk_transfer(devh, 0x83, buf, sizeof(buf), &actual_length, 10);
-    print_bulk_result("0x83",EP83_error, r, actual_length, buf);
+    print_bulk_result("0x83", EP83_error, r, actual_length, buf);
   }
 
-  void DriverFlir::setup(void){
-
-    do{
+  void DriverFlir::setup(void) {
+    do {
       switch (setup_states) {
         case SETUP_INIT:
           if (libusb_init(&context) < 0) {
-            ROS_ERROR("failed to initialise libusb");
+            RCLCPP_ERROR(node_->get_logger(), "failed to initialise libusb");
             setup_states = SETUP_ERROR;
           } else {
-            ROS_INFO("Successfully initialise libusb");
-            setup_states = SETUP_FIND;
+            RCLCPP_INFO(node_->get_logger(), "Successfully initialised libusb");
             setup_states = SETUP_LISTING;
           }
           break;
@@ -373,83 +322,78 @@ namespace driver_flir
         case SETUP_LISTING:
         {
           int rc = 0;
-          libusb_device_handle *dev_handle = NULL   ;
-          libusb_device        **devs               ;
+          libusb_device_handle *dev_handle = nullptr;
+          libusb_device **devs;
           int count = libusb_get_device_list(context, &devs);
-
-         for (size_t idx = 0; idx < count; ++idx) {
+          for (size_t idx = 0; idx < static_cast<size_t>(count); ++idx) {
             libusb_device *device = devs[idx];
             libusb_device_descriptor desc = {0};
-
             rc = libusb_get_device_descriptor(device, &desc);
             assert(rc == 0);
-
-            ROS_DEBUG("Vendor:Device = %04x:%04x", desc.idVendor, desc.idProduct);
-         }
-         libusb_free_device_list(devs, 1); //free the list, unref the devices in it
-         setup_states = SETUP_FIND;
-        }
+            RCLCPP_DEBUG(node_->get_logger(), "Vendor:Device = %04x:%04x", desc.idVendor, desc.idProduct);
+          }
+          libusb_free_device_list(devs, 1);
+          setup_states = SETUP_FIND;
           break;
+        }
 
         case SETUP_FIND:
           devh = libusb_open_device_with_vid_pid(context, vendor_id, product_id);
-          if ( devh == NULL ) {
-            ROS_ERROR_STREAM("Could not find/open device. devh : " << devh);
+          if (devh == nullptr) {
+            RCLCPP_ERROR(node_->get_logger(), "Could not find/open device. devh: %p", devh);
             setup_states = SETUP_ERROR;
           } else {
-            ROS_INFO("Successfully find the Flir One G2 device");
+            RCLCPP_INFO(node_->get_logger(), "Successfully found the Flir One G2 device");
             setup_states = SETUP_SET_CONF;
           }
           break;
 
         case SETUP_SET_CONF:
-          ROS_INFO("A Live");
+          RCLCPP_INFO(node_->get_logger(), "Setting USB configuration 3");
           if (int r = libusb_set_configuration(devh, 3) < 0) {
-            ROS_ERROR("libusb_set_configuration error %d", r);
+            RCLCPP_ERROR(node_->get_logger(), "libusb_set_configuration error %d", r);
             setup_states = SETUP_ERROR;
           } else {
-            ROS_INFO("Successfully set usb configuration 3");
+            RCLCPP_INFO(node_->get_logger(), "Successfully set usb configuration 3");
             setup_states = SETUP_CLAIM_INTERFACE_0;
           }
           break;
 
         case SETUP_CLAIM_INTERFACE_0:
-          if (int r = libusb_claim_interface(devh, 0) <0) {
-            ROS_ERROR("libusb_claim_interface 0 error %d", r);
+          if (int r = libusb_claim_interface(devh, 0) < 0) {
+            RCLCPP_ERROR(node_->get_logger(), "libusb_claim_interface 0 error %d", r);
             setup_states = SETUP_ERROR;
           } else {
-            ROS_INFO("Successfully claimed interface 1");
+            RCLCPP_INFO(node_->get_logger(), "Successfully claimed interface 0");
             setup_states = SETUP_CLAIM_INTERFACE_1;
           }
           break;
 
         case SETUP_CLAIM_INTERFACE_1:
-          if (int r = libusb_claim_interface(devh, 1) <0) {
-            ROS_ERROR("libusb_claim_interface 1 error %d", r);
+          if (int r = libusb_claim_interface(devh, 1) < 0) {
+            RCLCPP_ERROR(node_->get_logger(), "libusb_claim_interface 1 error %d", r);
             setup_states = SETUP_ERROR;
           } else {
-            ROS_INFO("Successfully claimed interface 1");
+            RCLCPP_INFO(node_->get_logger(), "Successfully claimed interface 1");
             setup_states = SETUP_CLAIM_INTERFACE_2;
           }
           break;
 
         case SETUP_CLAIM_INTERFACE_2:
-          if (int r = libusb_claim_interface(devh, 2) <0) {
-            ROS_ERROR("libusb_claim_interface 2 error %d", r);
+          if (int r = libusb_claim_interface(devh, 2) < 0) {
+            RCLCPP_ERROR(node_->get_logger(), "libusb_claim_interface 2 error %d", r);
             setup_states = SETUP_ERROR;
           } else {
-            ROS_INFO("Successfully claimed interface 2");
+            RCLCPP_INFO(node_->get_logger(), "Successfully claimed interface 2");
             setup_states = SETUP_ALL_OK;
           }
           break;
-
       }
-    } while ( (setup_states != SETUP_ERROR) && (setup_states != SETUP_ALL_OK) );
+    } while ((setup_states != SETUP_ERROR) && (setup_states != SETUP_ALL_OK));
 
-    if (setup_states == SETUP_ERROR){
-     	shutdown();
+    if (setup_states == SETUP_ERROR) {
+      shutdown();
     }
-
   }
 
-};
+}; // namespace driver_flir
